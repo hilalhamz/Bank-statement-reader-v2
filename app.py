@@ -1,146 +1,358 @@
-import streamlit as st
-import pandas as pd
-import pdfplumber
 import io
 from datetime import datetime
+
+import pandas as pd
+import pdfplumber
+import streamlit as st
 import xlsxwriter
 
+# ---------------------------
+# App setup
+# ---------------------------
 st.set_page_config(page_title="Bank Statement Reader V2", layout="wide")
-
 st.title("🏦 Bank Statement Reader V2 — PDF & CSV → Excel")
 
-st.write("""
-Upload a **bank statement (CSV or PDF)** and get a clean Excel report with:
-- Categorized transactions  
-- Monthly income vs expenses  
-- Category breakdown charts  
-""")
+st.write(
+    "Upload a **bank statement** (PDF or CSV). Get a clean, categorized Excel with KPIs, "
+    "monthly chart, and category breakdown. For **password-protected PDFs**, enter the password below. "
+    "Scanned PDFs (images) aren’t supported—export CSV from your bank or OCR first."
+)
 
-# --- File Uploaders ---
-uploaded_file = st.file_uploader("Upload a Bank Statement (PDF or CSV)", type=["pdf", "csv"])
-uploaded_keywords = st.file_uploader("Upload Keyword Mapping (CSV with Keyword,Category)", type=["csv"])
+# ---------------------------
+# Inputs
+# ---------------------------
+uploaded_file = st.file_uploader("Upload statement (PDF or CSV)", type=["pdf", "csv"])
+pdf_password = st.text_input("PDF password (if your PDF is protected)", type="password", value="")
 
-# Default keywords
-keywords = {"uber": "Transport", "netflix": "Entertainment", "carrefour": "Groceries"}
+kw_file = st.file_uploader("Optional: Keyword mapping (CSV with columns: Keyword,Category)", type=["csv"])
 
-if uploaded_keywords:
+# Default keywords (you can change these)
+DEFAULT_KEYWORDS = {
+    "uber": "Transport",
+    "taxi": "Transport",
+    "fuel": "Transport",
+    "shell": "Transport",
+    "carrefour": "Groceries",
+    "grocery": "Groceries",
+    "netflix": "Subscriptions",
+    "spotify": "Subscriptions",
+    "amazon": "Shopping",
+    "noon": "Shopping",
+    "gym": "Health & Fitness",
+    "pharmacy": "Health & Fitness",
+    "rent": "Housing",
+    "etisalat": "Utilities",
+    "du ": "Utilities",
+    "salary": "Income",
+    "transfer in": "Income",
+    "transfer out": "Transfers",
+}
+
+# ---------------------------
+# Keyword loader
+# ---------------------------
+def load_keywords(uploaded):
+    if not uploaded:
+        return DEFAULT_KEYWORDS
     try:
-        kw_df = pd.read_csv(uploaded_keywords)
-        keywords = dict(zip(kw_df["Keyword"].str.lower(), kw_df["Category"]))
-        st.success("Custom keyword mapping loaded.")
+        df = pd.read_csv(uploaded)
+        df.columns = [c.strip() for c in df.columns]
+        if not {"Keyword", "Category"}.issubset(df.columns):
+            st.warning("Keyword CSV must have columns: Keyword, Category. Using default mapping.")
+            return DEFAULT_KEYWORDS
+        # first-match wins; preserve order
+        mapping = {}
+        for k, c in zip(df["Keyword"], df["Category"]):
+            k = str(k).strip().lower()
+            c = str(c).strip()
+            if k:
+                mapping[k] = c
+        return mapping or DEFAULT_KEYWORDS
     except Exception as e:
-        st.error(f"Keyword file error: {e}")
+        st.warning(f"Could not read keyword CSV ({e}). Using default mapping.")
+        return DEFAULT_KEYWORDS
 
-# --- Helper: Categorize transactions ---
-def categorize(description):
-    if pd.isna(description):
+KEYWORDS = load_keywords(kw_file)
+
+def categorize(desc: str) -> str:
+    if pd.isna(desc):
         return "Uncategorized"
-    desc = str(description).lower()
-    for key, cat in keywords.items():
-        if key in desc:
+    txt = str(desc).lower()
+    for kw, cat in KEYWORDS.items():
+        if kw in txt:
             return cat
     return "Uncategorized"
 
-# --- Parse CSV ---
-def parse_csv(file):
+# ---------------------------
+# CSV parser
+# ---------------------------
+def parse_csv(file) -> pd.DataFrame:
     try:
         df = pd.read_csv(file)
     except UnicodeDecodeError:
         df = pd.read_csv(file, encoding="latin1")
 
-    df.columns = [c.lower().strip() for c in df.columns]
-    if "date" not in df.columns or "amount" not in df.columns:
-        # Try alternative column names
-        if "debit" in df.columns and "credit" in df.columns:
-            df["amount"] = df["credit"].fillna(0) - df["debit"].fillna(0)
-        if "description" not in df.columns:
-            df["description"] = df.iloc[:, 1]
+    # Normalize headers
+    cols_lower = [c.lower().strip() for c in df.columns]
+    df.columns = cols_lower
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["category"] = df["description"].apply(categorize)
-    df["type"] = df["amount"].apply(lambda x: "Income" if x > 0 else "Expense")
-    return df[["date", "description", "amount", "category", "type"]]
+    # Heuristics for common schemas
+    date_col = None
+    descr_col = None
+    amount_col = None
 
-# --- Parse PDF ---
-def parse_pdf(file):
+    # date
+    for c in df.columns:
+        if any(k in c for k in ["date", "txn date", "posting date"]):
+            date_col = c
+            break
+    if date_col is None:
+        date_col = df.columns[0]  # fallback
+
+    # description
+    for c in df.columns:
+        if any(k in c for k in ["description", "details", "memo", "narration", "merchant"]):
+            descr_col = c
+            break
+    if descr_col is None:
+        descr_col = df.columns[min(1, len(df.columns) - 1)]
+
+    # amount
+    for c in df.columns:
+        if any(k in c for k in ["amount", "amt", "value"]):
+            amount_col = c
+            break
+    if amount_col is None:
+        # If debit/credit exist, combine
+        debit = next((c for c in df.columns if "debit" in c), None)
+        credit = next((c for c in df.columns if "credit" in c), None)
+        if debit or credit:
+            df["__amount__"] = 0.0
+            if debit:
+                df["__amount__"] -= pd.to_numeric(
+                    pd.Series(df[debit]).astype(str).str.replace(",", "").str.extract(r"([-+]?\d*\.?\d+)")[0],
+                    errors="coerce",
+                ).fillna(0)
+            if credit:
+                df["__amount__"] += pd.to_numeric(
+                    pd.Series(df[credit]).astype(str).str.replace(",", "").str.extract(r"([-+]?\d*\.?\d+)")[0],
+                    errors="coerce",
+                ).fillna(0)
+            amount_col = "__amount__"
+        else:
+            amount_col = df.columns[-1]  # last column fallback
+
+    out = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(df[date_col], errors="coerce"),
+            "Description": df[descr_col].astype(str),
+            "Amount": pd.to_numeric(
+                pd.Series(df[amount_col])
+                .astype(str)
+                .str.replace(",", "")
+                .str.replace("(", "-")
+                .str.replace(")", ""),
+                errors="coerce",
+            ),
+        }
+    ).dropna(subset=["Date", "Amount"], how="any")
+
+    out["Category"] = out["Description"].apply(categorize)
+    out["Type"] = out["Amount"].apply(lambda x: "Income" if x > 0 else "Expense" if x < 0 else "")
+    return out
+
+# ---------------------------
+# PDF parser (password-aware)
+# ---------------------------
+def parse_pdf(file, password: str = "") -> pd.DataFrame:
     data = []
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            table = page.extract_table()
-            if not table:
-                continue
-            for row in table:
-                if len(row) < 2:
-                    continue
-                try:
-                    date = pd.to_datetime(row[0], errors="coerce")
-                    desc = row[1]
-                    amt = None
-                    for cell in row[2:]:
-                        try:
-                            amt = float(str(cell).replace(",", "").replace("AED", "").strip())
-                            break
-                        except:
+
+    try:
+        with pdfplumber.open(file, password=(password or "")) as pdf:
+            for page in pdf.pages:
+                # Try all tables on the page
+                tables = page.extract_tables() or []
+                for tbl in tables:
+                    if not tbl or len(tbl) < 1:
+                        continue
+
+                    # Header guess
+                    header = [str(h) if h is not None else "" for h in tbl[0]]
+                    # If header looks junky, treat all rows as data
+                    start_idx = 1
+                    if sum(1 for h in header if any(ch.isalpha() for ch in h)) < 2:
+                        header = [f"col{i+1}" for i in range(len(header))]
+                        start_idx = 0
+
+                    for row in tbl[start_idx:]:
+                        if not row:
                             continue
-                    if date and amt is not None:
-                        data.append([date, desc, amt])
-                except:
-                    continue
-    df = pd.DataFrame(data, columns=["date", "description", "amount"])
-    df["category"] = df["description"].apply(categorize)
-    df["type"] = df["amount"].apply(lambda x: "Income" if x > 0 else "Expense")
-    return df
+                        cells = [(c if c is not None else "") for c in row]
 
-# --- Main processing ---
-if uploaded_file:
-    if uploaded_file.name.endswith(".csv"):
-        df = parse_csv(uploaded_file)
-    else:
-        df = parse_pdf(uploaded_file)
+                        # Try first cell as date
+                        date_val = pd.to_datetime(str(cells[0]).strip(), errors="coerce")
 
-    st.subheader("📊 Preview")
-    st.dataframe(df.head(20))
+                        # Amount: search numeric-looking from right
+                        amt_val = None
+                        for cell in reversed(cells):
+                            s = str(cell).replace(",", "").replace("AED", "").strip()
+                            try:
+                                amt_val = float(s)
+                                break
+                            except:
+                                continue
 
-    # KPIs
-    income = df[df["amount"] > 0]["amount"].sum()
-    expenses = df[df["amount"] < 0]["amount"].sum()
-    net = income + expenses
+                        # Description: use second cell or join middle cells
+                        descr_val = str(cells[1]).strip() if len(cells) > 1 else " ".join(cells)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Income", f"{income:,.2f}")
-    col2.metric("Total Expenses", f"{expenses:,.2f}")
-    col3.metric("Net", f"{net:,.2f}")
+                        if pd.notna(date_val) and amt_val is not None:
+                            data.append([date_val, descr_val, amt_val])
+
+    except Exception as e:
+        st.error(
+            "Couldn't open this PDF. If it's password-protected, enter the correct password above. "
+            "If it's a scanned image, export CSV from your bank or OCR it first."
+        )
+        raise e
+
+    if not data:
+        st.warning("No table-like data found in this PDF. Try CSV export from your bank.")
+        return pd.DataFrame(columns=["Date", "Description", "Amount", "Category", "Type"])
+
+    out = pd.DataFrame(data, columns=["Date", "Description", "Amount"])
+    out["Category"] = out["Description"].apply(categorize)
+    out["Type"] = out["Amount"].apply(lambda x: "Income" if x > 0 else "Expense" if x < 0 else "")
+    return out
+
+# ---------------------------
+# Excel export
+# ---------------------------
+def to_excel(transactions: pd.DataFrame, keywords_map: dict) -> bytes:
+    bio = io.BytesIO()
+    wb = xlsxwriter.Workbook(bio, {"in_memory": True})
+
+    fmt_header = wb.add_format({"bold": True, "bg_color": "#F2F2F2", "border": 1})
+    fmt_currency = wb.add_format({"num_format": "#,##0.00"})
+    fmt_date = wb.add_format({"num_format": "yyyy-mm-dd"})
+    fmt_bold = wb.add_format({"bold": True})
+
+    # Transactions
+    sh_tx = wb.add_worksheet("Transactions")
+    cols = ["Date", "Description", "Amount", "Category", "Type"]
+    sh_tx.write_row(0, 0, cols, fmt_header)
+    for r, row in enumerate(transactions.itertuples(index=False), start=1):
+        sh_tx.write_datetime(r, 0, datetime.combine(row.Date.to_pydatetime().date(), datetime.min.time()), fmt_date)
+        sh_tx.write(r, 1, row.Description)
+        sh_tx.write_number(r, 2, float(row.Amount), fmt_currency)
+        sh_tx.write(r, 3, row.Category)
+        sh_tx.write(r, 4, row.Type)
+    sh_tx.autofilter(0, 0, max(1, len(transactions)), len(cols) - 1)
+    sh_tx.set_column(0, 0, 12)
+    sh_tx.set_column(1, 1, 48)
+    sh_tx.set_column(2, 4, 16)
+
+    # Keywords
+    sh_kw = wb.add_worksheet("Keywords")
+    sh_kw.write_row(0, 0, ["Keyword", "Category"], fmt_header)
+    for i, (k, c) in enumerate(keywords_map.items(), start=1):
+        sh_kw.write(i, 0, k)
+        sh_kw.write(i, 1, c)
+    sh_kw.set_column(0, 1, 24)
+
+    # Summary (with formulas)
+    sh_sum = wb.add_worksheet("Summary")
+    sh_sum.write("A1", "KPIs", fmt_bold)
+    sh_sum.write_row("A3", ["Total Income", "Total Expenses", "Net"], fmt_header)
+    sh_sum.write_formula("A4", '=IFERROR(SUMIF(Transactions!E:E,"Income",Transactions!C:C),0)', fmt_currency)
+    sh_sum.write_formula("B4", '=IFERROR(-SUMIF(Transactions!E:E,"Expense",Transactions!C:C),0)', fmt_currency)
+    sh_sum.write_formula("C4", "=A4-B4", fmt_currency)
+
+    # Month derivation on Transactions
+    sh_tx.write(0, 5, "Month", fmt_header)
+    for r in range(1, len(transactions) + 1):
+        sh_tx.write_formula(r, 5, f'=TEXT(A{r+1},"yyyy-mm")')
+
+    # Monthly summary (spill)
+    sh_sum.write("A7", "Monthly Summary", fmt_bold)
+    sh_sum.write_row("A9", ["Month", "Income", "Expenses"], fmt_header)
+    sh_sum.write_formula("A10", '=IFERROR(UNIQUE(FILTER(Transactions!F:F,Transactions!F:F<>"")), "")')
+    for i in range(0, 24):
+        rr = 10 + i
+        sh_sum.write_formula(rr - 1, 1, f'=IF(A{rr}="", "", IFERROR(SUMIFS(Transactions!C:C,Transactions!E:E,"Income",Transactions!F:F,A{rr}),0))', fmt_currency)
+        sh_sum.write_formula(rr - 1, 2, f'=IF(A{rr}="", "", IFERROR(-SUMIFS(Transactions!C:C,Transactions!E:E,"Expense",Transactions!F:F,A{rr}),0))', fmt_currency)
 
     # Charts
-    monthly = df.groupby(df["date"].dt.to_period("M"))["amount"].sum().reset_index()
-    monthly["date"] = monthly["date"].astype(str)
+    chart1 = wb.add_chart({"type": "column"})
+    chart1.add_series({"name": "Income", "categories": "=Summary!$A$10:$A$33", "values": "=Summary!$B$10:$B$33"})
+    chart1.add_series({"name": "Expenses", "categories": "=Summary!$A$10:$A$33", "values": "=Summary!$C$10:$C$33"})
+    chart1.set_title({"name": "Monthly Income vs Expenses"})
+    sh_sum.insert_chart("E9", chart1, {"x_scale": 1.2, "y_scale": 1.2})
 
-    st.subheader("📈 Monthly Net Flow")
-    st.bar_chart(monthly, x="date", y="amount")
+    chart2 = wb.add_chart({"type": "doughnut"})
+    sh_sum.write("A36", "Expenses by Category", fmt_bold)
+    sh_sum.write_row("A38", ["Category", "Total Spent"], fmt_header)
+    sh_sum.write_formula("A39", '=IFERROR(UNIQUE(FILTER(Transactions!D:D,Transactions!D:D<>"")), "")')
+    for i in range(0, 50):
+        rr = 39 + i
+        sh_sum.write_formula(rr - 1, 1, f'=IF(A{rr}="", "", IFERROR(-SUMIFS(Transactions!C:C,Transactions!D:D,A{rr},Transactions!E:E,"Expense"),0))', fmt_currency)
+    chart2.add_series({"name": "Expenses by Category", "categories": "=Summary!$A$39:$A$88", "values": "=Summary!$B$39:$B$88"})
+    chart2.set_title({"name": "Expenses by Category"})
+    sh_sum.insert_chart("E38", chart2, {"x_scale": 1.2, "y_scale": 1.2})
 
-    cats = df.groupby("category")["amount"].sum().reset_index()
-    st.subheader("📊 Category Breakdown")
-    st.bar_chart(cats, x="category", y="amount")
+    wb.close()
+    bio.seek(0)
+    return bio.getvalue()
 
-    # --- Export to Excel ---
-    def to_excel(df):
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, sheet_name="Transactions", index=False)
-            # Summary
-            summary = pd.DataFrame({
-                "Metric": ["Income", "Expenses", "Net"],
-                "Amount": [income, expenses, net]
-            })
-            summary.to_excel(writer, sheet_name="Summary", index=False)
-        return output.getvalue()
+# ---------------------------
+# Run
+# ---------------------------
+process = st.button("Parse & Generate")
 
-    st.download_button(
-        label="📥 Download Excel",
-        data=to_excel(df),
-        file_name="bank_statement_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-else:
-    st.info("Please upload a PDF or CSV to begin.")
-# Streamlit app entrypoint placeholder
+if process:
+    if not uploaded_file:
+        st.warning("Upload a PDF or CSV to continue.")
+        st.stop()
+
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            tx = parse_csv(uploaded_file)
+        else:
+            tx = parse_pdf(uploaded_file, pdf_password)
+
+        if tx.empty:
+            st.info("No transactions found. Try another file or use CSV export from your bank.")
+            st.stop()
+
+        st.success(f"Parsed {len(tx):,} transactions.")
+        st.dataframe(tx.head(50), use_container_width=True)
+
+        income = float(tx.loc[tx["Amount"] > 0, "Amount"].sum())
+        expense = float(-tx.loc[tx["Amount"] < 0, "Amount"].sum())
+        net = income - expense
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Income", f"{income:,.2f}")
+        c2.metric("Total Expenses", f"{expense:,.2f}")
+        c3.metric("Net", f"{net:,.2f}")
+
+        # Monthly chart
+        tmp = tx.copy()
+        tmp["Month"] = tx["Date"].dt.to_period("M").astype(str)
+        st.subheader("📈 Monthly Net Flow")
+        st.bar_chart(tmp.groupby("Month")["Amount"].sum())
+
+        st.subheader("📊 Category Breakdown")
+        st.bar_chart(tx.groupby("Category")["Amount"].sum())
+
+        excel_bytes = to_excel(tx, KEYWORDS)
+        st.download_button(
+            "📥 Download Excel (transactions + summary + charts)",
+            data=excel_bytes,
+            file_name="Bank_Statement_Reader_V2.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        st.caption("Note: Works with digital PDFs (text-selectable). Scanned PDFs need OCR or CSV export.")
+    except Exception as e:
+        st.error("Parsing failed. Check password (for PDFs) or try CSV export from your bank.")
+
