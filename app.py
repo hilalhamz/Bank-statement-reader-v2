@@ -5,21 +5,20 @@ import streamlit as st
 import pdfplumber
 import xlsxwriter
 
-# -------------------- App setup --------------------
+# -------------------- App --------------------
 st.set_page_config(page_title="Bank Statement Reader V2", layout="wide")
 st.title("Bank Statement Reader V2 — PDF & CSV → Excel")
 st.write(
-    "Upload a bank statement (PDF or CSV). You’ll get a clean Excel with categorized transactions, KPIs, "
-    "monthly chart, and category breakdown. For password-protected PDFs, enter the password. "
+    "Upload a bank statement (PDF or CSV). You’ll get a clean, categorized Excel with KPIs, "
+    "monthly chart, and category breakdown. If your PDF is password-protected, enter it below. "
     "Scanned PDFs (images) aren’t supported—export CSV or OCR first."
 )
 
-# -------------------- Inputs --------------------
 uploaded_file = st.file_uploader("Upload statement (PDF or CSV)", type=["pdf", "csv"])
 pdf_password  = st.text_input("PDF password (if protected)", type="password")
 kw_file       = st.file_uploader("Optional keyword map (CSV: Keyword,Category)", type=["csv"])
 
-# -------------------- Defaults --------------------
+# -------------------- Keyword mapping --------------------
 DEFAULT_KEYWORDS = {
     "uber":"Transport","taxi":"Transport","fuel":"Transport","shell":"Transport",
     "carrefour":"Groceries","grocery":"Groceries",
@@ -27,21 +26,9 @@ DEFAULT_KEYWORDS = {
     "amazon":"Shopping","noon":"Shopping",
     "gym":"Health & Fitness","pharmacy":"Health & Fitness",
     "rent":"Housing","etisalat":"Utilities","du ":"Utilities",
-    "salary":"Income","transfer in":"Income","transfer out":"Transfers",
+    "salary":"Income","transfer in":"Income","refund":"Income","reversal":"Income",
 }
 
-# Date patterns incl. 13JUL25
-DATE_PATS = [
-    r"\b\d{2}[A-Za-z]{3}\d{2,4}\b",       # 13JUL25 / 13JUL2025
-    r"\b\d{4}-\d{2}-\d{2}\b",             # 2025-08-05
-    r"\b\d{2}/\d{2}/\d{4}\b",             # 05/08/2025
-    r"\b\d{2}-\d{2}-\d{4}\b",             # 05-08-2025
-    r"\b\d{2}\s+[A-Za-z]{3}\s+\d{4}\b",   # 05 Aug 2025
-    r"\b[A-Za-z]{3}\s+\d{2},\s+\d{4}\b",  # Aug 05, 2025
-]
-AMOUNT_PAT = r"[+-]?\(?\s*[$AEDQRSAR£€₹]?\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:Cr|DR|CR|Dr)?\s*\)?"
-
-# -------------------- Keyword mapping --------------------
 def load_keywords(uploaded):
     if not uploaded: return DEFAULT_KEYWORDS
     try:
@@ -50,11 +37,11 @@ def load_keywords(uploaded):
         if not {"Keyword","Category"}.issubset(df.columns):
             st.warning("Keyword CSV must have columns: Keyword, Category. Using defaults.")
             return DEFAULT_KEYWORDS
-        mp = {}
-        for k, c in zip(df["Keyword"], df["Category"]):
+        m = {}
+        for k,c in zip(df["Keyword"], df["Category"]):
             k = str(k).strip().lower(); c = str(c).strip()
-            if k: mp[k] = c
-        return mp or DEFAULT_KEYWORDS
+            if k: m[k] = c
+        return m or DEFAULT_KEYWORDS
     except Exception as e:
         st.warning(f"Could not read keyword CSV ({e}). Using defaults.")
         return DEFAULT_KEYWORDS
@@ -84,13 +71,9 @@ def parse_csv(file) -> pd.DataFrame:
         if debit or credit:
             df["__amount__"] = 0.0
             if debit:
-                df["__amount__"] -= pd.to_numeric(
-                    pd.Series(df[debit]).astype(str).str.replace(",","").str.extract(r"([-+]?\d*\.?\d+)")[0],
-                    errors="coerce").fillna(0)
+                df["__amount__"] -= pd.to_numeric(pd.Series(df[debit]).astype(str).str.replace(",","").str.extract(r"([-+]?\d*\.?\d+)")[0], errors="coerce").fillna(0)
             if credit:
-                df["__amount__"] += pd.to_numeric(
-                    pd.Series(df[credit]).astype(str).str.replace(",","").str.extract(r"([-+]?\d*\.?\d+)")[0],
-                    errors="coerce").fillna(0)
+                df["__amount__"] += pd.to_numeric(pd.Series[df[credit] if isinstance(df, dict) else df[credit]].astype(str).str.replace(",","").str.extract(r"([-+]?\d*\.?\d+)")[0], errors="coerce").fillna(0)
             amt_col = "__amount__"
         else:
             amt_col = df.columns[-1]
@@ -99,20 +82,45 @@ def parse_csv(file) -> pd.DataFrame:
         "Date": pd.to_datetime(df[date_col], errors="coerce"),
         "Description": df[desc_col].astype(str),
         "Amount": pd.to_numeric(
-            pd.Series(df[amt_col]).astype(str)
-            .str.replace(",","").str.replace("(","-").str.replace(")",""),
-            errors="coerce"),
+            pd.Series(df[amt_col]).astype(str).str.replace(",","").str.replace("(","-").str.replace(")",""),
+            errors="coerce"
+        )
     }).dropna(subset=["Date","Amount"], how="any")
 
     out["Category"] = out["Description"].apply(categorize)
     out["Type"] = out["Amount"].apply(lambda x: "Income" if x > 0 else "Expense" if x < 0 else "")
     return out
 
-# -------------------- Helpers for PDF --------------------
-def _clean_amount(s: str):
-    s = s.replace(",","").strip()
+# -------------------- PDF helpers --------------------
+DATE_PATS = [
+    r"\b\d{2}[A-Za-z]{3}\d{2,4}\b",       # 13JUL25 / 13JUL2025
+    r"\b\d{4}-\d{2}-\d{2}\b",             # 2025-08-05
+    r"\b\d{2}/\d{2}/\d{4}\b",             # 05/08/2025
+    r"\b\d{2}-\d{2}-\d{4}\b",             # 05-08-2025
+    r"\b\d{2}\s+[A-Za-z]{3}\s+\d{4}\b",   # 05 Aug 2025
+    r"\b[A-Za-z]{3}\s+\d{2},\s+\d{4}\b",  # Aug 05, 2025
+]
+AMOUNT_TOKEN = r"[+-]?\(?\s*[$AEDQRSAR£€₹]?\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*\)?"
+
+EXPENSE_HINTS = ["pos-purchase","purchase","debit card","card no.","food","restaurant","grocer","super market","noon","amazon","uber","taxi","fuel"]
+INCOME_HINTS  = ["salary","refund","credit","reversal","transfer in","deposit"]
+
+def _looks_expense(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in EXPENSE_HINTS)
+
+def _looks_income(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in INCOME_HINTS)
+
+def _clean_amount_strict(s: str):
+    """Return float or None. Reject tokens that look like balance (contain Cr/DR)."""
+    s0 = s
+    if re.search(r"\b(cr|dr)\b", s0, re.I):
+        return None
+    s = s0.replace(",", "").strip()
     neg = "(" in s and ")" in s
-    s = re.sub(r"[^\d\.\-]", "", s)  # strip currency, Cr/DR text
+    s = re.sub(r"[^\d\.\-]", "", s)
     if not s: return None
     try:
         v = float(s)
@@ -132,14 +140,15 @@ def _parse_bank_date(tok: str):
 def parse_pdf(file, password: str = "") -> pd.DataFrame:
     data = []
     with pdfplumber.open(file, password=(password or "")) as pdf:
-        # 1) TABLES: map Date / Description / Debits / Credits; set sign correctly
+        # 1) Structured tables: Date / Description / Debits / Credits
         for page in pdf.pages:
             tables = page.extract_tables() or []
             for tbl in tables:
-                if not tbl or len(tbl) < 2: continue
+                if not tbl or len(tbl) < 2: 
+                    continue
                 header = [str(h or "").strip().lower() for h in tbl[0]]
 
-                def idx(names):  # find header index
+                def idx(names):
                     for i, h in enumerate(header):
                         if any(n in h for n in names): return i
                     return None
@@ -148,71 +157,101 @@ def parse_pdf(file, password: str = "") -> pd.DataFrame:
                 i_desc = idx(["description","details","narration"])
                 i_deb  = idx(["debit"])
                 i_cred = idx(["credit"])
-                i_bal  = idx(["balance"])
+                i_bal  = idx(["balance"])  # only to skip
 
                 if i_date is not None and (i_deb is not None or i_cred is not None):
                     for row in tbl[1:]:
                         cells = ["" if c is None else str(c) for c in row]
-
-                        # skip brought/carried forward lines
-                        if re.search(r"\b(brought|carried)\s+forward\b", " ".join(cells), flags=re.I):
+                        if re.search(r"\b(brought|carried)\s+forward\b", " ".join(cells), re.I):
                             continue
 
                         raw_date = cells[i_date] if i_date < len(cells) else ""
                         d = _parse_bank_date(str(raw_date))
 
-                        # description: all non-amount, non-date, non-balance cells joined
+                        # description from non-amount, non-date, non-balance cells
                         desc_parts = []
                         for j, c in enumerate(cells):
-                            if j in [i_date, i_deb, i_cred, i_bal]: continue
+                            if j in [i_date, i_deb, i_cred, i_bal]: 
+                                continue
                             cs = str(c).strip()
-                            if not cs: continue
-                            if re.search(AMOUNT_PAT, cs): continue
+                            if not cs: 
+                                continue
+                            if re.search(r"\b(cr|dr)\b", cs, re.I): 
+                                continue
+                            if re.search(r"[0-9]", cs) and _clean_amount_strict(cs) is not None:
+                                continue
                             desc_parts.append(cs)
                         desc = " ".join(desc_parts).strip()
 
-                        debit  = _clean_amount(cells[i_deb])  if (i_deb  is not None and i_deb  < len(cells)) else None
-                        credit = _clean_amount(cells[i_cred]) if (i_cred is not None and i_cred < len(cells)) else None
+                        debit  = _clean_amount_strict(cells[i_deb])  if (i_deb  is not None and i_deb  < len(cells)) else None
+                        credit = _clean_amount_strict(cells[i_cred]) if (i_cred is not None and i_cred < len(cells)) else None
 
-                        # CORRECT SIGN LOGIC:
+                        # CORRECT SIGN: debit -> negative; credit -> positive
                         amount = None
-                        if debit is not None and debit != 0:
-                            amount = -abs(debit)      # expenses negative
-                        elif credit is not None and credit != 0:
-                            amount = abs(credit)       # income positive
+                        if debit is not None and abs(debit) > 0:
+                            amount = -abs(debit)
+                        elif credit is not None and abs(credit) > 0:
+                            amount = abs(credit)
 
                         if pd.notna(d) and amount is not None:
                             data.append([d, desc, amount])
 
-        # 2) TEXT fallback: date token + last number on line (skip balance lines)
+        # 2) Text fallback (if no structured rows captured)
         if not data:
             for page in pdf.pages:
                 txt = page.extract_text() or ""
                 for line in txt.splitlines():
                     ln = line.strip()
-                    if not ln or re.search(r"balance", ln, re.I):  # avoid picking the Balance column
+                    if not ln: 
                         continue
+                    if re.search(r"\bbalance\b", ln, re.I):  # ignore balance lines entirely
+                        continue
+
                     # date
                     dm = None; dtxt = ""
                     for pat in DATE_PATS:
                         m = re.search(pat, ln)
                         if m: dm = m; dtxt = m.group(0); break
-                    if not dm: continue
-                    # amount = last occurrence
-                    last = None
-                    for m in re.finditer(AMOUNT_PAT, ln.replace(",","")):
-                        last = m
-                    if not last: continue
-                    amt = _clean_amount(last.group(0))
-                    if amt is None: continue
+                    if not dm: 
+                        continue
+
+                    # prefer 'AED <amount>' in the line
+                    aed_match = re.search(r"\bAED\s*([0-9,]+(?:\.\d{1,2})?)\b", ln, re.I)
+                    amt = None
+                    if aed_match:
+                        amt = _clean_amount_strict(aed_match.group(1))
+                    else:
+                        # fall back to last numeric token, but reject ones with Cr/DR
+                        last = None
+                        for m in re.finditer(AMOUNT_TOKEN, ln.replace(",","")):
+                            last = m
+                        if last:
+                            candidate = last.group(0)
+                            if not re.search(r"\b(cr|dr)\b", candidate, re.I):
+                                amt = _clean_amount_strict(candidate)
+
+                    if amt is None:
+                        continue
 
                     d = _parse_bank_date(dtxt)
-                    if pd.isna(d): continue
+                    if pd.isna(d): 
+                        continue
 
                     before = ln[:dm.start()].strip()
                     after  = ln[dm.end():].strip()
-                    after_wo = re.sub(AMOUNT_PAT, "", after).strip()
-                    desc = (before + " " + after_wo).strip()
+                    # remove the amount token region from the tail to get cleaner description
+                    if aed_match:
+                        after = after.replace(aed_match.group(0), "").strip()
+                    else:
+                        after = re.sub(AMOUNT_TOKEN, "", after).strip()
+                    desc = (before + " " + after).strip()
+
+                    # infer sign when unknown: purchases/food/etc -> negative; salary/refund -> positive
+                    if _looks_expense(desc) and (amt is not None and amt > 0):
+                        amt = -abs(amt)
+                    if _looks_income(desc) and (amt is not None and amt < 0):
+                        amt = abs(amt)
+
                     data.append([d, desc, amt])
 
     if not data:
@@ -274,7 +313,7 @@ def to_excel(transactions: pd.DataFrame, keywords_map: dict) -> bytes:
     chart1.add_series({"name":"Income","categories":"=Summary!$A$10:$A$33","values":"=Summary!$B$10:$B$33"})
     chart1.add_series({"name":"Expenses","categories":"=Summary!$A$10:$A$33","values":"=Summary!$C$10:$C$33"})
     chart1.set_title({"name":"Monthly Income vs Expenses"})
-    sm.insert_chart("E9", chart1, {"x_scale":1.2,"y_scale":1.2})
+    sm.insert_chart("E9", chart1, {"x_scale":1.2, "y_scale":1.2})
 
     chart2 = wb.add_chart({"type":"doughnut"})
     sm.write("A36","Expenses by Category",fmt_b)
@@ -285,7 +324,7 @@ def to_excel(transactions: pd.DataFrame, keywords_map: dict) -> bytes:
         sm.write_formula(rr-1,1,f'=IF(A{rr}="", "", IFERROR(-SUMIFS(Transactions!C:C,Transactions!D:D,A{rr},Transactions!E:E,"Expense"),0))',fmt_cur)
     chart2.add_series({"name":"Expenses by Category","categories":"=Summary!$A$39:$A$88","values":"=Summary!$B$39:$B$88"})
     chart2.set_title({"name":"Expenses by Category"})
-    sm.insert_chart("E38", chart2, {"x_scale":1.2,"y_scale":1.2})
+    sm.insert_chart("E38", chart2, {"x_scale":1.2, "y_scale":1.2})
 
     wb.close(); bio.seek(0)
     return bio.getvalue()
@@ -309,14 +348,15 @@ if st.button("Parse & Generate"):
         income  = float(tx.loc[tx["Amount"]>0, "Amount"].sum())
         expense = float(-tx.loc[tx["Amount"]<0, "Amount"].sum())
         net     = income - expense
+
         c1,c2,c3 = st.columns(3)
         c1.metric("Total Income",   f"{income:,.2f}")
         c2.metric("Total Expenses", f"{expense:,.2f}")
         c3.metric("Net",            f"{net:,.2f}")
 
         tmp = tx.copy(); tmp["Month"] = pd.to_datetime(tmp["Date"]).dt.to_period("M").astype(str)
-        st.subheader("Monthly Net Flow");     st.bar_chart(tmp.groupby("Month")["Amount"].sum())
-        st.subheader("Category Breakdown");   st.bar_chart(tx.groupby("Category")["Amount"].sum())
+        st.subheader("Monthly Net Flow");   st.bar_chart(tmp.groupby("Month")["Amount"].sum())
+        st.subheader("Category Breakdown"); st.bar_chart(tx.groupby("Category")["Amount"].sum())
 
         st.download_button(
             "Download Excel (transactions + summary + charts)",
@@ -325,7 +365,7 @@ if st.button("Parse & Generate"):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        st.caption("Tip: Debits show as negative (Expense), Credits as positive (Income). "
+        st.caption("Debits show as negative (Expense), Credits as positive (Income). "
                    "If the PDF is scanned (no selectable text), use CSV export or OCR first.")
     except Exception:
         st.error("Parsing failed. Check PDF password or try CSV export.")
